@@ -68,11 +68,8 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
     lines = {"CM": "移动", "CU": "联通", "CT": "电信", "AB": "境外", "DEF": "默认"}
     line_name = lines.get(line, "默认")
     
-    # 华为云强制取 1 个以防格式错误，其余云取配置数量
-    if config.get("dns_server") == 3:
-        target_count = 1
-    else:
-        target_count = config.get("affect_num", 2)
+    # 彻底解锁数量限制，所有云厂商均完全听从配置
+    target_count = config.get("affect_num", 2)
     
     selected_ips = []
     for cf in c_info:
@@ -102,12 +99,11 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
     sub_tag = f"{sub_domain}." if sub_domain != "@" else ""
     full_domain = f"{sub_tag}{domain}"
 
-    # 保护机制：如果当前 DNS 的 IP 已经是我们要优选的 IP，直接跳过，避免无效的删写
     if sorted(selected_ips) == sorted(existing_ips):
         print(f"SKIP UPDATE: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----REASON: IPs unchanged.")
         return
 
-    # ========== 核心修改：先彻底删除所有旧记录 ==========
+    # 先全部删除所有旧记录，保证干干净净
     if s_info:
         for info in s_info:
             try:
@@ -117,16 +113,28 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
             except Exception as e:
                 print(f"DELETE OLD DNS ERROR: ----DOMAIN: {full_domain}----MESSAGE: {e}")
 
-    # ========== 再将优选出的 IP 循环作为全新记录写入 ==========
-    for ip in selected_ips:
+    # 再写入新记录，分流处理
+    if config.get("dns_server") == 3:
+        # 【华为云专属路径】: 将多个 IP 作为一个列表，一次性打包装填
         try:
-            ret = cloud.create_record(domain, sub_domain, ip, recordType, line_name, config["ttl"])
+            ret = cloud.create_record(domain, sub_domain, selected_ips, recordType, line_name, config["ttl"])
             if ret.get("code") == 0 or "id" in ret:
-                print(f"CREATE NEW DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----VALUE: {ip}")
+                print(f"CREATE NEW DNS SUCCESS (HUAWEI MULTI-IP): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----VALUES: {selected_ips}")
             else:
-                print(f"CREATE NEW DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
+                print(f"CREATE NEW DNS ERROR (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
         except Exception as e:
-            print(f"CREATE NEW DNS EXCEPTION: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE:\n{e}")
+            print(f"CREATE NEW DNS EXCEPTION (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE:\n{e}")
+    else:
+        # 【阿里云/腾讯云路径】: 分开循环单独写入
+        for ip in selected_ips:
+            try:
+                ret = cloud.create_record(domain, sub_domain, ip, recordType, line_name, config["ttl"])
+                if ret.get("code") == 0 or "id" in ret:
+                    print(f"CREATE NEW DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----VALUE: {ip}")
+                else:
+                    print(f"CREATE NEW DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
+            except Exception as e:
+                print(f"CREATE NEW DNS EXCEPTION: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE:\n{e}")
 
 def main(cloud, iptype):
     recordType = "AAAA" if iptype == 'v6' else "A"
@@ -134,10 +142,29 @@ def main(cloud, iptype):
     if not DOMAINS:
         return
 
+    # ================= 核心突破：华为云 SDK 动态热修复 =================
+    if config.get("dns_server") == 3 and hasattr(cloud, 'client'):
+        try:
+            original_create = cloud.client.create_record_set_with_line
+            def mocked_create(request):
+                try:
+                    # 拦截请求体，解开多余的列表嵌套
+                    if hasattr(request, 'body') and hasattr(request.body, 'records'):
+                        records = request.body.records
+                        if isinstance(records, list) and len(records) == 1 and isinstance(records[0], list):
+                            request.body.records = records[0]
+                except Exception:
+                    pass
+                # 放行拦截，发送正确格式给华为云服务器
+                return original_create(request)
+            cloud.client.create_record_set_with_line = mocked_create
+        except Exception as e:
+            print(f"HUAWEI SDK PATCH FAILED: {e}")
+    # ====================================================================
+
     try:
         affect_num = config.get("affect_num", 2)
 
-        # 1. 获取动态 API 优选 IP 
         cfips = get_optimization_ip(iptype)
         cf_cmips, cf_cuips, cf_ctips = [], [], []
         if cfips and cfips.get("code") == 200:
@@ -145,7 +172,6 @@ def main(cloud, iptype):
             cf_cuips = cfips["info"].get("CU", [])
             cf_ctips = cfips["info"].get("CT", [])
 
-        # 2. 严格按顺序截取静态高分库前 N 名
         static_icn_url = "https://raw.githubusercontent.com/yuanxiawan/cfipv4db/refs/heads/main/high_score_ips.txt"
         static_ips = get_static_ips_solid(static_icn_url, top_n=affect_num)
         if not static_ips:
