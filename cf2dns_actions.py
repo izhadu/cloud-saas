@@ -40,7 +40,7 @@ def get_optimization_ip(iptype):
         print(f"CHANGE OPTIMIZATION IP ERROR: {e}")
         return None
 
-def get_static_ips_solid(url, top_n=2):
+def get_static_ips_solid(url, top_n=3):
     """云端实在策略：绝对信任国内开源维护者的测速排名，严格按顺序截取榜单前 N 名"""
     try:
         response = requests.get(url, timeout=15)
@@ -52,7 +52,6 @@ def get_static_ips_solid(url, top_n=2):
                     parts = line.split()
                     if parts:
                         ip = parts[0]
-                        # 使用 index 模拟延迟分数，确保后续系统按原文件的真实名次进行提取
                         results.append({"ip": ip, "speed": 999.0, "rtt_avg": float(index)})
                         if len(results) >= top_n:
                             break
@@ -69,8 +68,11 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
     lines = {"CM": "移动", "CU": "联通", "CT": "电信", "AB": "境外", "DEF": "默认"}
     line_name = lines.get(line, "默认")
     
-    # 统一遵循 CONFIG 中的 affect_num 参数来决定提取多少个 IP
-    target_count = config.get("affect_num", 2)
+    # 华为云强制取 1 个以防格式错误，其余云取配置数量
+    if config.get("dns_server") == 3:
+        target_count = 1
+    else:
+        target_count = config.get("affect_num", 2)
     
     selected_ips = []
     for cf in c_info:
@@ -100,41 +102,31 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
     sub_tag = f"{sub_domain}." if sub_domain != "@" else ""
     full_domain = f"{sub_tag}{domain}"
 
+    # 保护机制：如果当前 DNS 的 IP 已经是我们要优选的 IP，直接跳过，避免无效的删写
     if sorted(selected_ips) == sorted(existing_ips):
         print(f"SKIP UPDATE: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----REASON: IPs unchanged.")
         return
 
-    # ========== 核心修改：改为循环遍历独立添加/修改，化解华为云格式报错 ==========
-    for i in range(len(selected_ips)):
-        ip = selected_ips[i]
-        try:
-            if i < len(s_info):
-                # 用新的独立 IP 字符串覆盖旧记录
-                record_id = s_info[i]["recordId"]
-                ret = cloud.change_record(domain, record_id, sub_domain, ip, recordType, line_name, config["ttl"])
-                if ret.get("code") == 0 or "id" in ret:
-                    print(f"CHANGE DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----VALUE: {ip}")
-                else:
-                    print(f"CHANGE DNS ERROR (SAFE SKIP): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
-            else:
-                # 循环新增独立的 A 记录
-                ret = cloud.create_record(domain, sub_domain, ip, recordType, line_name, config["ttl"])
-                if ret.get("code") == 0 or "id" in ret:
-                    print(f"CREATE DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----VALUE: {ip}")
-                else:
-                    print(f"CREATE DNS ERROR (SAFE SKIP): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
-        except Exception as e:
-            print(f"LOOP UPDATE ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE:\n{e}")
-
-    # ========== 循环清理多余的历史遗留记录 ==========
-    if len(s_info) > len(selected_ips):
-        for i in range(len(selected_ips), len(s_info)):
+    # ========== 核心修改：先彻底删除所有旧记录 ==========
+    if s_info:
+        for info in s_info:
             try:
                 if hasattr(cloud, 'del_record'):
-                    cloud.del_record(domain, s_info[i]["recordId"])
-                    print(f"CLEANUP SURPLUS DNS: ----DOMAIN: {full_domain}----RECORDID: {s_info[i]['recordId']}")
-            except Exception:
-                pass
+                    cloud.del_record(domain, info["recordId"])
+                    print(f"DELETE OLD DNS SUCCESS: ----DOMAIN: {full_domain}----RECORDLINE: {line_name}----RECORDID: {info['recordId']}")
+            except Exception as e:
+                print(f"DELETE OLD DNS ERROR: ----DOMAIN: {full_domain}----MESSAGE: {e}")
+
+    # ========== 再将优选出的 IP 循环作为全新记录写入 ==========
+    for ip in selected_ips:
+        try:
+            ret = cloud.create_record(domain, sub_domain, ip, recordType, line_name, config["ttl"])
+            if ret.get("code") == 0 or "id" in ret:
+                print(f"CREATE NEW DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----VALUE: {ip}")
+            else:
+                print(f"CREATE NEW DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
+        except Exception as e:
+            print(f"CREATE NEW DNS EXCEPTION: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE:\n{e}")
 
 def main(cloud, iptype):
     recordType = "AAAA" if iptype == 'v6' else "A"
@@ -143,10 +135,9 @@ def main(cloud, iptype):
         return
 
     try:
-        # 获取全局配置的 IP 数量
         affect_num = config.get("affect_num", 2)
 
-        # 1. 获取动态 API 优选 IP (用于日常域名)
+        # 1. 获取动态 API 优选 IP 
         cfips = get_optimization_ip(iptype)
         cf_cmips, cf_cuips, cf_ctips = [], [], []
         if cfips and cfips.get("code") == 200:
@@ -154,7 +145,7 @@ def main(cloud, iptype):
             cf_cuips = cfips["info"].get("CU", [])
             cf_ctips = cfips["info"].get("CT", [])
 
-        # 2. 严格按顺序截取静态高分库前 N 名 (用于视频域名)
+        # 2. 严格按顺序截取静态高分库前 N 名
         static_icn_url = "https://raw.githubusercontent.com/yuanxiawan/cfipv4db/refs/heads/main/high_score_ips.txt"
         static_ips = get_static_ips_solid(static_icn_url, top_n=affect_num)
         if not static_ips:
