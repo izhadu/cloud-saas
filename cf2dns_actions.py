@@ -59,14 +59,12 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
 
     # 检查是否需要更新（如果选出的 IP 和线上现有的 IP 完全一致，则跳过）
     existing_ips = [info.get("value") for info in s_info]
-    # 针对华为云可能返回的数组格式做展平处理
     flat_existing = []
     for val in existing_ips:
         if isinstance(val, list):
             flat_existing.extend(val)
         elif isinstance(val, str) and "[" in val:
             try:
-                # 尝试解析类似于 "['1.1.1.1', '2.2.2.2']" 的字符串
                 flat_existing.extend(json.loads(val.replace("'", '"')))
             except:
                 flat_existing.append(val)
@@ -78,40 +76,63 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
         return
 
     try:
-        if s_info:
-            # 存在旧记录 -> 更新
-            # 获取第一个 recordId 进行更新
-            record_id = s_info[0]["recordId"]
+        # ==========================================
+        # 华为云专版逻辑：先删后建，彻底规避 0312/0335/0002 错误
+        # ==========================================
+        if config.get("dns_server") == 3:  # 3 代表华为云
+            if s_info:
+                # 1. 强制清理该线路上已存在的所有旧记录
+                for info in s_info:
+                    try:
+                        if hasattr(cloud, 'del_record'):
+                            cloud.del_record(domain, info["recordId"])
+                            print(f"DELETE OLD DNS SUCCESS: ----DOMAIN: {domain}----RECORDID: {info['recordId']}")
+                    except Exception as e:
+                        print(f"DELETE OLD DNS ERROR: {e}")
             
-            # 【修复核心】：如果是华为云，直接传入整个 list，底层的 huawei.py 需要支持 list 参数
-            # 如果是其他云，可能需要转换或底层自动处理
-            value_to_pass = selected_ips if config.get("dns_server") == 3 else selected_ips[0] if len(selected_ips) == 1 else selected_ips
-            
-            ret = cloud.change_record(domain, record_id, sub_domain, value_to_pass, recordType, line_name, config["ttl"])
-            
-            # 如果更新成功，但还需要处理多余的旧记录（比如以前单条单条建的废记录），则清理掉
-            if ret.get("code") == 0 and len(s_info) > 1:
-                for extra_info in s_info[1:]:
-                    if hasattr(cloud, 'del_record'):
-                        cloud.del_record(domain, extra_info["recordId"])
-                        
-            if config["dns_server"] != 1 or ret["code"] == 0:
-                print(f"CHANGE DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {selected_ips}")
-            else:
-                print(f"CHANGE DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE: {ret.get('message', 'Unknown Error')}")
-                
+            # 2. 逐条创建全新的优质 IP
+            for ip in selected_ips:
+                ret = cloud.create_record(domain, sub_domain, ip, recordType, line_name, config["ttl"])
+                if ret.get("code") == 0:
+                    print(f"CREATE DNS SUCCESS (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {ip}")
+                else:
+                    print(f"CREATE DNS ERROR (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE: {ret.get('message', 'Unknown Error')}")
+                    
         else:
-            # 不存在记录 -> 创建
-            value_to_pass = selected_ips if config.get("dns_server") == 3 else selected_ips[0] if len(selected_ips) == 1 else selected_ips
-            ret = cloud.create_record(domain, sub_domain, value_to_pass, recordType, line_name, config["ttl"])
-            
-            if config["dns_server"] != 1 or ret["code"] == 0:
-                print(f"CREATE DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {selected_ips}")
+            # ==========================================
+            # 其他云 (DNSPod / 阿里云) 维持原有的更新逻辑
+            # ==========================================
+            if s_info:
+                # 存在旧记录 -> 更新
+                record_id = s_info[0]["recordId"]
+                value_to_pass = selected_ips[0] if len(selected_ips) == 1 else selected_ips
+                
+                ret = cloud.change_record(domain, record_id, sub_domain, value_to_pass, recordType, line_name, config["ttl"])
+                
+                # 清理多余旧记录
+                if ret.get("code") == 0 and len(s_info) > 1:
+                    for extra_info in s_info[1:]:
+                        if hasattr(cloud, 'del_record'):
+                            cloud.del_record(domain, extra_info["recordId"])
+                            
+                if config["dns_server"] != 1 or ret["code"] == 0:
+                    print(f"CHANGE DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {selected_ips}")
+                else:
+                    print(f"CHANGE DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE: {ret.get('message', 'Unknown Error')}")
+                    
             else:
-                print(f"CREATE DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE: {ret.get('message', 'Unknown Error')}")
+                # 不存在记录 -> 创建
+                value_to_pass = selected_ips[0] if len(selected_ips) == 1 else selected_ips
+                ret = cloud.create_record(domain, sub_domain, value_to_pass, recordType, line_name, config["ttl"])
+                
+                if config["dns_server"] != 1 or ret["code"] == 0:
+                    print(f"CREATE DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {selected_ips}")
+                else:
+                    print(f"CREATE DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE: {ret.get('message', 'Unknown Error')}")
                 
     except Exception as e:
         print(f"CHANGE DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE:\n{traceback.format_exc()}")
+
 
 def main(cloud, iptype):
     recordType = "AAAA" if iptype == 'v6' else "A"
