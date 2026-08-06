@@ -27,10 +27,10 @@ def get_optimization_ip(iptype):
             res_data = response.json()
             if res_data and "info" in res_data:
                 for line_key in res_data["info"]:
-                    # 按速度降序，延迟升序，确保提取的第一个绝对是带宽之王
+                    # 按 speed 降序，按 rtt_avg 升序
                     res_data["info"][line_key] = sorted(
                         res_data["info"][line_key],
-                        key=lambda x: (-float(x.get("speed", 0)), float(x.get("latency", 9999)))
+                        key=lambda x: (-float(x.get("speed", 0)), float(x.get("rtt_avg", 9999)))
                     )
             return res_data
         else:
@@ -66,7 +66,7 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
         # ==========================================
         if config.get("dns_server") == 3:
             if s_info:
-                # 核心防撞车逻辑：检查 best_ip 是否已经存在于现有的任意一条记录中
+                # 检查 best_ip 是否已经存在于现有的任意一条记录中
                 target_record_id = None
                 for info in s_info:
                     val = str(info.get("value", ""))
@@ -90,7 +90,8 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
                     record_id = s_info[0]["recordId"]
                     ret = cloud.change_record(domain, record_id, sub_domain, best_ip, recordType, line_name, config["ttl"])
                     
-                    if ret.get("code") == 0:
+                    # 华为云的正确响应可能包含 id 字段而没有 code 字段
+                    if ret.get("code") == 0 or "id" in ret:
                         print(f"CHANGE DNS SUCCESS (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {best_ip}")
                     else:
                         print(f"CHANGE DNS ERROR (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
@@ -107,7 +108,7 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
             else:
                 # 没有任何旧记录，直接新建
                 ret = cloud.create_record(domain, sub_domain, best_ip, recordType, line_name, config["ttl"])
-                if ret.get("code") == 0:
+                if ret.get("code") == 0 or "id" in ret:
                     print(f"CREATE DNS SUCCESS (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {best_ip}")
                 else:
                     print(f"CREATE DNS ERROR (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
@@ -158,7 +159,6 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
                 
     except Exception as e:
         print(f"CHANGE DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----MESSAGE:\n{traceback.format_exc()}")
-
 
 def main(cloud, iptype):
     recordType = "AAAA" if iptype == 'v6' else "A"
