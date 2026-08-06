@@ -5,7 +5,7 @@ on:
     branches: 
       - main
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '0 */1 * * *'
   workflow_dispatch: # 添加此配置即可支持在 GitHub 网页界面手动点击运行
 
 jobs:
