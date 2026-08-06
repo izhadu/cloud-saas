@@ -6,19 +6,25 @@ on:
       - main
   schedule:
     - cron: '*/15 * * * *'
+  workflow_dispatch: # 添加此配置即可支持在 GitHub 网页界面手动点击运行
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: 'Checkout'
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # 建议升级到 v4，性能更好更稳定
+
       - name: 'Set up Python'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5 # 建议升级到 v5
         with:
           python-version: '3.12'
+
       - name: 'Install dependencies'
-        run: if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
       - name: 'run cf2dns'
         env:
           CONFIG: ${{ secrets.CONFIG }}
