@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Mail: tongdongdong@outlook.com
 
-import sys, os, json, requests, time, traceback, socket, concurrent.futures
+import sys, os, json, requests, time, traceback
 
 from dns.qCloud import QcloudApiv3
 from dns.aliyun import AliApi
@@ -13,7 +13,7 @@ DOMAINS = json.loads(os.environ.get("DOMAINS", "{}"))
 provider_data = json.loads(os.environ.get("PROVIDER", "[]"))
 
 def get_optimization_ip(iptype):
-    """获取动态 API 优选 IP"""
+    """获取动态 API 优选 IP (用于日常加速)"""
     try:
         headers = {'Content-Type': 'application/json'}
         data = {"key": config.get("key"), "type": iptype}
@@ -40,40 +40,25 @@ def get_optimization_ip(iptype):
         print(f"CHANGE OPTIMIZATION IP ERROR: {e}")
         return None
 
-def tcp_ping(ip, port=443, timeout=2.0):
-    """单 IP TCP 测速"""
-    try:
-        start = time.time()
-        socket.create_connection((ip, port), timeout=timeout).close()
-        return ip, (time.time() - start) * 1000
-    except Exception:
-        return ip, float('inf')
-
-def get_static_ips_and_test(url, top_n=2):
-    """并发测速静态高分库"""
+def get_static_ips_solid(url, top_n=2):
+    """云端实在策略：绝对信任国内开源维护者的测速排名，严格按顺序截取榜单前 N 名"""
     try:
         response = requests.get(url, timeout=15)
         if response.status_code == 200:
-            raw_ips = []
-            for line in response.text.splitlines():
+            results = []
+            for index, line in enumerate(response.text.splitlines()):
                 line = line.strip()
                 if line and not line.startswith("#"):
                     parts = line.split()
                     if parts:
-                        raw_ips.append(parts[0])
-
-            results = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(tcp_ping, ip): ip for ip in raw_ips}
-                for future in concurrent.futures.as_completed(futures):
-                    ip, latency = future.result()
-                    if latency != float('inf'):
-                        results.append({"ip": ip, "speed": 999.0, "rtt_avg": latency})
-                        
-            results = sorted(results, key=lambda x: x["rtt_avg"])
-            return results[:top_n]
+                        ip = parts[0]
+                        # 使用 index 模拟延迟分数，确保后续系统按原文件的真实名次进行提取
+                        results.append({"ip": ip, "speed": 999.0, "rtt_avg": float(index)})
+                        if len(results) >= top_n:
+                            break
+            return results
     except Exception as e:
-        print(f"GET & TEST STATIC IPS ERROR: {e}")
+        print(f"GET STATIC IPS ERROR: {e}")
     return []
 
 def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
@@ -84,7 +69,7 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
     lines = {"CM": "移动", "CU": "联通", "CT": "电信", "AB": "境外", "DEF": "默认"}
     line_name = lines.get(line, "默认")
     
-    # 统一遵循 CONFIG 中的 affect_num 参数
+    # 统一遵循 CONFIG 中的 affect_num 参数来决定提取多少个 IP
     target_count = config.get("affect_num", 2)
     
     selected_ips = []
@@ -94,7 +79,7 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
         else:
             break
 
-    # 解析已存在的 IP
+    # 解析当前云端已存在的 IP
     existing_ips = []
     for info in s_info:
         val = info.get("value")
@@ -115,25 +100,24 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
     sub_tag = f"{sub_domain}." if sub_domain != "@" else ""
     full_domain = f"{sub_tag}{domain}"
 
-    # 检查是否完全一致，避免频繁调用 API
     if sorted(selected_ips) == sorted(existing_ips):
         print(f"SKIP UPDATE: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----REASON: IPs unchanged.")
         return
 
-    # ========== 核心逻辑：彻底转为循环独立添加/修改 ==========
+    # ========== 核心修改：改为循环遍历独立添加/修改，化解华为云格式报错 ==========
     for i in range(len(selected_ips)):
         ip = selected_ips[i]
         try:
             if i < len(s_info):
-                # 用新的 IP 覆盖旧的记录 ID
+                # 用新的独立 IP 字符串覆盖旧记录
                 record_id = s_info[i]["recordId"]
                 ret = cloud.change_record(domain, record_id, sub_domain, ip, recordType, line_name, config["ttl"])
                 if ret.get("code") == 0 or "id" in ret:
                     print(f"CHANGE DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----VALUE: {ip}")
                 else:
-                    print(f"CHANGE DNS ERROR: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
+                    print(f"CHANGE DNS ERROR (SAFE SKIP): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
             else:
-                # 旧记录不够用，新增独立的记录
+                # 循环新增独立的 A 记录
                 ret = cloud.create_record(domain, sub_domain, ip, recordType, line_name, config["ttl"])
                 if ret.get("code") == 0 or "id" in ret:
                     print(f"CREATE DNS SUCCESS: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {full_domain}----RECORDLINE: {line_name}----VALUE: {ip}")
@@ -162,7 +146,7 @@ def main(cloud, iptype):
         # 获取全局配置的 IP 数量
         affect_num = config.get("affect_num", 2)
 
-        # 1. 获取动态 API 优选 IP 
+        # 1. 获取动态 API 优选 IP (用于日常域名)
         cfips = get_optimization_ip(iptype)
         cf_cmips, cf_cuips, cf_ctips = [], [], []
         if cfips and cfips.get("code") == 200:
@@ -170,9 +154,9 @@ def main(cloud, iptype):
             cf_cuips = cfips["info"].get("CU", [])
             cf_ctips = cfips["info"].get("CT", [])
 
-        # 2. 实时测速并获取静态高分库 top N
+        # 2. 严格按顺序截取静态高分库前 N 名 (用于视频域名)
         static_icn_url = "https://raw.githubusercontent.com/yuanxiawan/cfipv4db/refs/heads/main/high_score_ips.txt"
-        static_ips = get_static_ips_and_test(static_icn_url, top_n=affect_num)
+        static_ips = get_static_ips_solid(static_icn_url, top_n=affect_num)
         if not static_ips:
             print(f"GET STATIC IPS FAILED: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         
