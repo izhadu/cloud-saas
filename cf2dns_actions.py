@@ -48,7 +48,7 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
     lines = {"CM": "移动", "CU": "联通", "CT": "电信", "AB": "境外", "DEF": "默认"}
     line_name = lines.get(line, "默认")
     
-    # 【核心】：华为云强制只用 1 个极速 IP，避开底层 SDK 的 List 解析 Bug
+    # 华为云强制只用 1 个极速 IP
     target_count = 1 if config.get("dns_server") == 3 else config.get("affect_num", 2)
     
     selected_ips = []
@@ -58,53 +58,54 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
         else:
             break
 
-    # 校验是否需要更新
-    existing_ips = [info.get("value") for info in s_info]
-    flat_existing = []
-    for val in existing_ips:
-        if isinstance(val, list):
-            flat_existing.extend(val)
-        elif isinstance(val, str) and "[" in val:
-            try:
-                flat_existing.extend(json.loads(val.replace("'", '"')))
-            except:
-                flat_existing.append(val)
-        else:
-            flat_existing.append(val)
-
-    if sorted(selected_ips) == sorted(flat_existing):
-        print(f"SKIP UPDATE: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----REASON: IPs unchanged.")
-        return
+    best_ip = selected_ips[0]
 
     try:
         # ==========================================
         # 华为云专版逻辑 (dns_server == 3)
         # ==========================================
         if config.get("dns_server") == 3:
-            best_ip = selected_ips[0] # 仅使用速度最快的单个 IP
-            
             if s_info:
-                # 1. 采用“就地更新”策略，不删除，直接覆盖第一条记录，避开 PENDING_DELETE
-                record_id = s_info[0]["recordId"]
-                ret = cloud.change_record(domain, record_id, sub_domain, best_ip, recordType, line_name, config["ttl"])
-                
-                if ret.get("code") == 0:
-                    print(f"CHANGE DNS SUCCESS (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {best_ip}")
+                # 核心防撞车逻辑：检查 best_ip 是否已经存在于现有的任意一条记录中
+                target_record_id = None
+                for info in s_info:
+                    val = str(info.get("value", ""))
+                    if best_ip in val:
+                        target_record_id = info["recordId"]
+                        break
+
+                if target_record_id:
+                    print(f"SKIP UPDATE (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----REASON: Best IP {best_ip} already exists.")
+                    # 保留这条正确的记录，静默清理同线路下的其他冗余垃圾记录
+                    for info in s_info:
+                        if info["recordId"] != target_record_id:
+                            try:
+                                if hasattr(cloud, 'del_record'):
+                                    cloud.del_record(domain, info["recordId"])
+                                    print(f"CLEANUP SURPLUS DNS: ----DOMAIN: {domain}----RECORDID: {info['recordId']}")
+                            except Exception:
+                                pass
                 else:
-                    # 抓取完整的返回包，彻底消灭 Unknown Error
-                    print(f"CHANGE DNS ERROR (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
-                
-                # 2. 如果存在之前残留的多条重复记录，静默清理掉
-                if len(s_info) > 1:
-                    for extra_info in s_info[1:]:
-                        try:
-                            if hasattr(cloud, 'del_record'):
-                                cloud.del_record(domain, extra_info["recordId"])
-                                print(f"CLEANUP SURPLUS DNS: ----DOMAIN: {domain}----RECORDID: {extra_info['recordId']}")
-                        except Exception:
-                            pass
+                    # best_ip 完全不存在，安全地拿第一条记录修改
+                    record_id = s_info[0]["recordId"]
+                    ret = cloud.change_record(domain, record_id, sub_domain, best_ip, recordType, line_name, config["ttl"])
+                    
+                    if ret.get("code") == 0:
+                        print(f"CHANGE DNS SUCCESS (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {best_ip}")
+                    else:
+                        print(f"CHANGE DNS ERROR (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----RAW_RESPONSE: {ret}")
+                    
+                    # 修改完第一条后，清理剩下的旧记录
+                    if len(s_info) > 1:
+                        for extra_info in s_info[1:]:
+                            try:
+                                if hasattr(cloud, 'del_record'):
+                                    cloud.del_record(domain, extra_info["recordId"])
+                                    print(f"CLEANUP SURPLUS DNS: ----DOMAIN: {domain}----RECORDID: {extra_info['recordId']}")
+                            except Exception:
+                                pass
             else:
-                # 不存在任何记录时新建
+                # 没有任何旧记录，直接新建
                 ret = cloud.create_record(domain, sub_domain, best_ip, recordType, line_name, config["ttl"])
                 if ret.get("code") == 0:
                     print(f"CREATE DNS SUCCESS (HUAWEI): ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----VALUE: {best_ip}")
@@ -115,6 +116,23 @@ def changeDNS(line, s_info, c_info, domain, sub_domain, cloud, iptype):
         # 其他云厂商 (DNSPod / Aliyun)
         # ==========================================
         else:
+            existing_ips = [info.get("value") for info in s_info]
+            flat_existing = []
+            for val in existing_ips:
+                if isinstance(val, list):
+                    flat_existing.extend(val)
+                elif isinstance(val, str) and "[" in val:
+                    try:
+                        flat_existing.extend(json.loads(val.replace("'", '"')))
+                    except:
+                        flat_existing.append(val)
+                else:
+                    flat_existing.append(val)
+
+            if sorted(selected_ips) == sorted(flat_existing):
+                print(f"SKIP UPDATE: ----Time: {time.strftime('%Y-%m-%d %H:%M:%S')}----DOMAIN: {domain}----SUBDOMAIN: {sub_domain}----RECORDLINE: {line_name}----REASON: IPs unchanged.")
+                return
+
             if s_info:
                 record_id = s_info[0]["recordId"]
                 value_to_pass = selected_ips[0] if len(selected_ips) == 1 else selected_ips
